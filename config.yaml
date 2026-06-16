@@ -1,0 +1,67 @@
+# 新高値ブレイク投資スクリーニングツール 設定ファイル
+
+# データソース設定
+data_source: yfinance  # yfinance | jquants
+
+# J-Quants API設定（data_source: jquants の場合に使用）
+jquants:
+  api_key: ""
+
+# スクリーニングパラメータ
+screening:
+  # 新高値判定：過去N営業日の最高値を更新したか
+  high_lookback_days: 250
+
+  # 初動継続フィルタ：高値更新がX営業日以内に発生
+  continuation_days: 3
+
+  # 初動継続フィルタ：現値が直近高値からY%以内
+  continuation_max_drop_pct: 3.0
+
+  # だまし除外：ブレイク後Z日以内に高値からこの%超下落でフラグ
+  false_breakout_drop_pct: 8.0
+  false_breakout_check_days: 10
+
+  # 出来高フィルタ：ブレイク日出来高が20日平均のW倍以上
+  volume_spike_ratio: 1.5
+  volume_avg_days: 20
+
+  # ROE下限
+  roe_min_pct: 10.0
+
+  # 損切りライン（参考表示用）
+  stop_loss_pct: 8.0
+
+# 相場環境フィルタ
+market_filter:
+  # 日経平均がこの%以上下落した日は新規エントリー非推奨
+  nikkei_drop_threshold_pct: -3.0
+  # 日経平均のティッカー
+  nikkei_ticker: "^N225"
+
+# 材料突合
+disclosure:
+  # TDnet RSSフィードURL
+  tdnet_rss_url: "https://www.release.tdnet.info/inbs/I_list_001_00.html"
+  # 注目キーワード
+  keywords:
+    - 上方修正
+    - 最高益
+    - 増配
+    - 自社株買い
+    - 株式分割
+    - 業績予想の修正
+    - 新製品
+    - 新サービス
+    - 業務提携
+
+# 出力設定
+output:
+  csv_dir: "./output"
+  csv_filename_format: "watchlist_{date}.csv"
+
+# SQLiteキャッシュ
+database:
+  path: "./data/stock_cache.db"
+  # キャッシュの有効期間（時間）。0で毎回取得
+  cache_hours: 12
