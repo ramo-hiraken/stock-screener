@@ -5,9 +5,6 @@ import yfinance as yf
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from db import get_fresh_codes, load_ohlcv_batch, save_ohlcv_batch
-from screener import _download_chunk
-
 try:
     from jpx_list import build_name_map as _build_name_map
     _NAME_MAP: dict[str, str] | None = None
@@ -22,48 +19,60 @@ except ImportError:
         return {}
 
 
+def _download_chunk(chunk: list[str]) -> dict[str, pd.DataFrame]:
+    result = {}
+    try:
+        tickers_str = " ".join(f"{c}.T" for c in chunk)
+        raw = yf.download(
+            tickers_str, period="5d", group_by="ticker",
+            progress=False, threads=True, timeout=30,
+        )
+    except Exception:
+        return result
+    if raw.empty:
+        return result
+    for code in chunk:
+        ticker = f"{code}.T"
+        try:
+            df = raw.copy() if len(chunk) == 1 else raw[ticker].copy()
+            df = df.dropna(subset=["Close"])
+            if not df.empty:
+                result[code] = df
+        except (KeyError, TypeError):
+            continue
+    return result
+
+
 def _price_prefilter(
     codes: list[str],
     max_unit_price: int = 1_000_000,
     progress_callback=None,
 ) -> dict[str, float]:
-    """OHLCVキャッシュから1単元(100株)が上限以下の銘柄を抽出。"""
-    fresh, stale = get_fresh_codes(codes)
+    """yf.downloadバッチで直近株価を取得し、1単元が上限以下の銘柄を抽出。"""
+    chunk_size = 200
+    chunks = [codes[i:i + chunk_size] for i in range(0, len(codes), chunk_size)]
+
+    if progress_callback:
+        progress_callback(0.05, f"{len(codes)}銘柄の価格取得中... ({len(chunks)}チャンク)")
+
+    done = 0
+    lock = threading.Lock()
+
+    def on_done(_):
+        nonlocal done
+        with lock:
+            done += 1
+            if progress_callback:
+                p = 0.05 + (done / len(chunks)) * 0.35
+                progress_callback(p, f"価格取得中... ({done}/{len(chunks)}チャンク)")
 
     ohlcv = {}
-    if fresh:
-        if progress_callback:
-            progress_callback(0.05, f"キャッシュから{len(fresh)}銘柄読み込み中...")
-        ohlcv.update(load_ohlcv_batch(fresh, days=10))
-
-    if stale:
-        chunk_size = 200
-        chunks = [stale[i:i + chunk_size] for i in range(0, len(stale), chunk_size)]
-        if progress_callback:
-            progress_callback(0.10, f"{len(stale)}銘柄の価格取得中...")
-
-        done = 0
-        lock = threading.Lock()
-
-        def on_done(_):
-            nonlocal done
-            with lock:
-                done += 1
-                if progress_callback:
-                    p = 0.10 + (done / len(chunks)) * 0.30
-                    progress_callback(p, f"価格取得中... ({done}/{len(chunks)}チャンク)")
-
-        downloaded = {}
-        with ThreadPoolExecutor(max_workers=min(len(chunks), 10)) as executor:
-            futures = [executor.submit(_download_chunk, chunk) for chunk in chunks]
-            for f in futures:
-                f.add_done_callback(on_done)
-            for future in as_completed(futures):
-                downloaded.update(future.result())
-
-        if downloaded:
-            save_ohlcv_batch(downloaded)
-        ohlcv.update(downloaded)
+    with ThreadPoolExecutor(max_workers=min(len(chunks), 10)) as executor:
+        futures = [executor.submit(_download_chunk, chunk) for chunk in chunks]
+        for f in futures:
+            f.add_done_callback(on_done)
+        for future in as_completed(futures):
+            ohlcv.update(future.result())
 
     result = {}
     max_price = max_unit_price / 100
