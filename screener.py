@@ -2,6 +2,8 @@
 
 import pandas as pd
 import numpy as np
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from data_source import get_data_source, DataSourceBase
@@ -207,27 +209,12 @@ def check_roe(info: dict) -> dict:
 # 統合スクリーニング
 # ---------------------------------------------------------------------------
 
-def screen_breakout(
-    codes: list[str] | None = None,
-    progress_callback=None,
-) -> pd.DataFrame:
-    """全フィルタを適用した新高値ブレイクスクリーニング。"""
-    if codes is None:
-        codes = SCREEN_CODES
-
-    source = get_data_source()
-    market = check_market_environment(source)
-    name_map = _get_name_map()
-    results = []
-    total = len(codes)
-
-    for i, code in enumerate(codes):
-        if progress_callback:
-            progress_callback(i / total, f"分析中: {code} ({i + 1}/{total})")
-
+def _analyze_one(code: str, source: DataSourceBase, market: dict, name_map: dict) -> dict | None:
+    """1銘柄の分析（並列実行用）。"""
+    try:
         hist = source.fetch_ohlcv(code, period_days=max(Screening.high_lookback_days + 30, 400))
         if hist.empty or len(hist) < 20:
-            continue
+            return None
 
         info = source.fetch_info(code)
 
@@ -257,7 +244,7 @@ def screen_breakout(
         market_cap = info.get("marketCap", 0)
         cap_oku = round(market_cap / 1e8, 1) if market_cap else None
 
-        results.append({
+        return {
             "コード": code,
             "銘柄名": name_map.get(code, info.get("shortName", info.get("longName", code))),
             "現在値": high_info.get("current_price", 0),
@@ -277,11 +264,50 @@ def screen_breakout(
             "セクター": info.get("sector", ""),
             "候補": is_candidate,
             "優先度": priority,
-            "材料": "",  # 材料突合層で埋める
+            "材料": "",
             "相場環境": "⚠️注意" if market.get("market_caution") else "通常",
             "日経変動(%)": market.get("nikkei_change_pct"),
             "損切ライン": round(high_info.get("current_price", 0) * (1 - Screening.stop_loss_pct / 100), 1),
-        })
+        }
+    except Exception:
+        return None
+
+
+def screen_breakout(
+    codes: list[str] | None = None,
+    progress_callback=None,
+    max_workers: int = 5,
+) -> pd.DataFrame:
+    """全フィルタを適用した新高値ブレイクスクリーニング（並列実行）。"""
+    if codes is None:
+        codes = SCREEN_CODES
+
+    source = get_data_source()
+    market = check_market_environment(source)
+    name_map = _get_name_map()
+    results = []
+    total = len(codes)
+    done_count = 0
+    lock = threading.Lock()
+
+    def on_done(future):
+        nonlocal done_count
+        with lock:
+            done_count += 1
+            if progress_callback:
+                progress_callback(done_count / total, f"分析中... ({done_count}/{total})")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for code in codes:
+            f = executor.submit(_analyze_one, code, source, market, name_map)
+            f.add_done_callback(on_done)
+            futures[f] = code
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                results.append(result)
 
     df = pd.DataFrame(results)
     if not df.empty:
