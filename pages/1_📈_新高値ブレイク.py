@@ -13,6 +13,12 @@ from portfolio import load_portfolio, add_position, remove_position, get_portfol
 from settings import Screening, MarketFilter
 from config import SCREEN_CODES
 
+try:
+    from jpx_list import get_codes_by_market
+    _JPX_AVAILABLE = True
+except ImportError:
+    _JPX_AVAILABLE = False
+
 st.title("📈 新高値ブレイク スクリーナー v2")
 st.caption("新高値更新 × 初動継続 × だまし除外 × 出来高急増 × 材料突合")
 
@@ -31,9 +37,11 @@ with tab1:
     with st.expander("フィルタ設定", expanded=False):
         fc1, fc2, fc3, fc4 = st.columns(4)
         with fc1:
+            market_options = ["グロース", "スタンダード", "プライム", "グロース+スタンダード"]
+            selected_market = st.selectbox("対象市場", market_options, index=0)
             custom_codes = st.text_area(
-                "銘柄コード（カンマ区切り、空欄で日経225+TOPIX100）",
-                placeholder="7203, 6758, 9984",
+                "銘柄コード（カンマ区切り、空欄で上記市場全銘柄）",
+                placeholder="3923, 4478, 7342",
             )
         with fc2:
             st.number_input("高値判定期間(日)", value=Screening.high_lookback_days, key="lookback", disabled=True)
@@ -50,6 +58,14 @@ with tab1:
         codes = None
         if custom_codes.strip():
             codes = [c.strip() for c in custom_codes.split(",") if c.strip()]
+        elif _JPX_AVAILABLE:
+            if "+" in selected_market:
+                codes = []
+                for m in selected_market.split("+"):
+                    codes.extend(get_codes_by_market(m.strip()))
+                codes = sorted(set(codes))
+            else:
+                codes = get_codes_by_market(selected_market)
 
         progress = st.progress(0, text="スクリーニング開始...")
         df = screen_breakout(codes, progress_callback=lambda p, t: progress.progress(p, text=t))

@@ -8,6 +8,19 @@ from data_source import get_data_source, DataSourceBase
 from settings import Screening, MarketFilter
 from config import SCREEN_CODES
 
+try:
+    from jpx_list import build_name_map as _build_name_map
+    _NAME_MAP: dict[str, str] | None = None
+
+    def _get_name_map() -> dict[str, str]:
+        global _NAME_MAP
+        if _NAME_MAP is None:
+            _NAME_MAP = _build_name_map()
+        return _NAME_MAP
+except ImportError:
+    def _get_name_map() -> dict[str, str]:
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # 1. 新高値判定
@@ -204,6 +217,7 @@ def screen_breakout(
 
     source = get_data_source()
     market = check_market_environment(source)
+    name_map = _get_name_map()
     results = []
     total = len(codes)
 
@@ -245,7 +259,7 @@ def screen_breakout(
 
         results.append({
             "コード": code,
-            "銘柄名": info.get("shortName", info.get("longName", code)),
+            "銘柄名": name_map.get(code, info.get("shortName", info.get("longName", code))),
             "現在値": high_info.get("current_price", 0),
             "直近高値": high_info.get("period_high", 0),
             "高値日付": high_info.get("period_high_date", ""),
@@ -290,7 +304,9 @@ def fetch_stock_data(code: str, period: str = "1y") -> dict | None:
     if hist.empty:
         return None
     info = source.fetch_info(code)
-    return {"code": code, "name": info.get("shortName", info.get("longName", code)), "history": hist, "info": info}
+    name_map = _get_name_map()
+    name = name_map.get(code, info.get("shortName", info.get("longName", code)))
+    return {"code": code, "name": name, "history": hist, "info": info}
 
 
 def check_new_high(hist: pd.DataFrame, lookback_days: int = 5) -> dict:
