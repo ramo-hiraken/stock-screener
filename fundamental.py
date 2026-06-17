@@ -76,15 +76,27 @@ def _price_prefilter(
 
     result = {}
     max_price = max_unit_price / 100
+    dead_count = 0
     for code, df in ohlcv.items():
         if df.empty:
             continue
         price = float(df["Close"].iloc[-1])
         if price <= max_price:
+            # TOB/上場廃止予定銘柄の除外: 直近の値幅が極端に小さい銘柄はスキップ
+            if len(df) >= 3:
+                period_high = float(df["High"].max())
+                period_low = float(df["Low"].min())
+                price_range_pct = (period_high - period_low) / period_low * 100 if period_low > 0 else 0
+                if price_range_pct < 0.5:
+                    dead_count += 1
+                    continue
             result[code] = price
 
     if progress_callback:
-        progress_callback(0.45, f"価格フィルタ: {len(result)}/{len(codes)}銘柄が対象")
+        msg = f"価格フィルタ: {len(result)}/{len(codes)}銘柄が対象"
+        if dead_count:
+            msg += f" (値動きなし{dead_count}銘柄除外)"
+        progress_callback(0.45, msg)
 
     return result
 

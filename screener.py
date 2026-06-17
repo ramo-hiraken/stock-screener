@@ -300,6 +300,13 @@ def _full_analysis(ohlcv_map: dict[str, pd.DataFrame], market: dict, name_map: d
         if biz_days >= 2:
             continue
 
+        # TOB/上場廃止予定: 直近10日の値幅が0.5%未満なら除外
+        recent = hist.iloc[-10:]
+        if len(recent) >= 3:
+            rng_pct = (float(recent["High"].max()) - float(recent["Low"].min())) / float(recent["Low"].min()) * 100
+            if rng_pct < 0.5:
+                continue
+
         high_info = detect_new_high(hist)
         cont = check_continuation(hist, high_info)
         false_bk = check_false_breakout(hist, high_info)
