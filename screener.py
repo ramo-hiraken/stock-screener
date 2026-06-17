@@ -1,12 +1,18 @@
-"""新高値ブレイク投資スクリーニング — 判定ロジック"""
+"""新高値ブレイク投資スクリーニング — 高速版
+
+初回: yf.download()バッチ取得 → SQLiteキャッシュ保存（〜30-40秒）
+2回目以降: キャッシュから即時読み込み → フィルタ（〜3秒）
+"""
 
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from data_source import get_data_source, DataSourceBase
+from db import get_fresh_codes, load_ohlcv_batch, save_ohlcv_batch
 from settings import Screening, MarketFilter
 from config import SCREEN_CODES
 
@@ -25,11 +31,107 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# 1. 新高値判定
+# バッチダウンロード（チャンク200、最大10並列）
+# ---------------------------------------------------------------------------
+
+def _download_chunk(chunk: list[str]) -> dict[str, pd.DataFrame]:
+    result = {}
+    try:
+        tickers_str = " ".join(f"{c}.T" for c in chunk)
+        raw = yf.download(
+            tickers_str, period="1y", group_by="ticker",
+            progress=False, threads=True, timeout=30,
+        )
+    except Exception:
+        return result
+
+    if raw.empty:
+        return result
+
+    for code in chunk:
+        ticker = f"{code}.T"
+        try:
+            if len(chunk) == 1:
+                df = raw.copy()
+            else:
+                df = raw[ticker].copy()
+            df = df.dropna(subset=["Close"])
+            if len(df) >= 20:
+                result[code] = df
+        except (KeyError, TypeError):
+            continue
+
+    return result
+
+
+def _batch_download_and_cache(
+    codes: list[str],
+    progress_callback=None,
+) -> dict[str, pd.DataFrame]:
+    """キャッシュ活用バッチ取得。staleな銘柄のみダウンロード。"""
+
+    # キャッシュ仕分け
+    fresh_codes, stale_codes = get_fresh_codes(codes)
+
+    all_data = {}
+
+    # キャッシュから読み込み
+    if fresh_codes:
+        if progress_callback:
+            progress_callback(0.05, f"キャッシュから{len(fresh_codes)}銘柄読み込み中...")
+        cached = load_ohlcv_batch(fresh_codes, days=400)
+        all_data.update(cached)
+
+    if not stale_codes:
+        if progress_callback:
+            progress_callback(0.70, f"全{len(all_data)}銘柄キャッシュヒット")
+        return all_data
+
+    # staleな銘柄をダウンロード
+    chunk_size = 200
+    chunks = [stale_codes[i:i + chunk_size] for i in range(0, len(stale_codes), chunk_size)]
+
+    if progress_callback:
+        progress_callback(0.10, f"{len(stale_codes)}銘柄をダウンロード中... ({len(chunks)}チャンク)")
+
+    done = 0
+    lock = threading.Lock()
+
+    def on_chunk_done(_):
+        nonlocal done
+        with lock:
+            done += 1
+            if progress_callback:
+                p = 0.10 + (done / len(chunks)) * 0.55
+                progress_callback(p, f"ダウンロード中... ({done}/{len(chunks)}チャンク完了)")
+
+    downloaded = {}
+    with ThreadPoolExecutor(max_workers=min(len(chunks), 10)) as executor:
+        futures = [executor.submit(_download_chunk, chunk) for chunk in chunks]
+        for f in futures:
+            f.add_done_callback(on_chunk_done)
+        for future in as_completed(futures):
+            downloaded.update(future.result())
+
+    # キャッシュに保存
+    if downloaded:
+        if progress_callback:
+            progress_callback(0.68, f"{len(downloaded)}銘柄をキャッシュに保存中...")
+        save_ohlcv_batch(downloaded)
+
+    all_data.update(downloaded)
+
+    if progress_callback:
+        progress_callback(0.70, f"合計{len(all_data)}銘柄のデータ準備完了")
+
+    return all_data
+
+
+# ---------------------------------------------------------------------------
+# 個別フィルタ関数
 # ---------------------------------------------------------------------------
 
 def detect_new_high(hist: pd.DataFrame) -> dict:
-    """過去 N 日の最高値を更新したか判定する。"""
     n = Screening.high_lookback_days
     if hist.empty or len(hist) < 20:
         return {"is_new_high": False}
@@ -53,12 +155,7 @@ def detect_new_high(hist: pd.DataFrame) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 2. 初動継続フィルタ
-# ---------------------------------------------------------------------------
-
 def check_continuation(hist: pd.DataFrame, high_info: dict) -> dict:
-    """高値更新が直近X営業日以内かつ、現値が直近高値からY%以内。"""
     if not high_info.get("is_new_high") or hist.empty:
         return {"continuation": False}
 
@@ -77,12 +174,7 @@ def check_continuation(hist: pd.DataFrame, high_info: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 3. だまし（ブレイク失敗）除外
-# ---------------------------------------------------------------------------
-
 def check_false_breakout(hist: pd.DataFrame, high_info: dict) -> dict:
-    """ブレイク後Z日以内に高値から8%超下落した場合フラグを立てる。"""
     if not high_info.get("is_new_high") or hist.empty:
         return {"false_breakout": False}
 
@@ -100,12 +192,7 @@ def check_false_breakout(hist: pd.DataFrame, high_info: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 4. 出来高フィルタ
-# ---------------------------------------------------------------------------
-
 def check_volume_spike(hist: pd.DataFrame) -> dict:
-    """直近の出来高が20日平均のW倍以上か。"""
     avg_days = Screening.volume_avg_days
     ratio_threshold = Screening.volume_spike_ratio
 
@@ -123,12 +210,7 @@ def check_volume_spike(hist: pd.DataFrame) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 5. 相場環境フィルタ
-# ---------------------------------------------------------------------------
-
 def check_market_environment(source: DataSourceBase | None = None) -> dict:
-    """日経平均の当日変動率をチェックし、大幅下落日はフラグ。"""
     if source is None:
         source = get_data_source()
 
@@ -148,10 +230,6 @@ def check_market_environment(source: DataSourceBase | None = None) -> dict:
         "nikkei_change_pct": round(change_pct, 2),
     }
 
-
-# ---------------------------------------------------------------------------
-# モメンタム分析（既存を維持）
-# ---------------------------------------------------------------------------
 
 def analyze_momentum(hist: pd.DataFrame) -> dict:
     if hist.empty or len(hist) < 50:
@@ -193,10 +271,6 @@ def analyze_momentum(hist: pd.DataFrame) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# ROEチェック（既存を維持）
-# ---------------------------------------------------------------------------
-
 def check_roe(info: dict) -> dict:
     roe = info.get("returnOnEquity")
     if roe is not None:
@@ -206,27 +280,30 @@ def check_roe(info: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 統合スクリーニング
+# フル分析
 # ---------------------------------------------------------------------------
 
-def _analyze_one(code: str, source: DataSourceBase, market: dict, name_map: dict) -> dict | None:
-    """1銘柄の分析（並列実行用）。"""
-    try:
-        hist = source.fetch_ohlcv(code, period_days=max(Screening.high_lookback_days + 30, 400))
-        if hist.empty or len(hist) < 20:
-            return None
+def _full_analysis(ohlcv_map: dict[str, pd.DataFrame], market: dict, name_map: dict) -> pd.DataFrame:
+    results = []
+    now = pd.Timestamp.now()
 
+    for code, hist in ohlcv_map.items():
+        if len(hist) < 20:
+            continue
+
+        # 上場廃止チェック: 直近2営業日以内に取引がなければ除外
         last_trade = hist.index[-1]
-        if (pd.Timestamp.now() - last_trade).days > 7:
-            return None
-
-        info = source.fetch_info(code)
+        cal_days = (now - last_trade).days
+        if cal_days > 5:
+            continue
+        biz_days = len(pd.bdate_range(last_trade, now)) - 1
+        if biz_days >= 2:
+            continue
 
         high_info = detect_new_high(hist)
         cont = check_continuation(hist, high_info)
         false_bk = check_false_breakout(hist, high_info)
         vol = check_volume_spike(hist)
-        roe_info = check_roe(info)
         momentum = analyze_momentum(hist)
 
         is_candidate = (
@@ -240,17 +317,12 @@ def _analyze_one(code: str, source: DataSourceBase, market: dict, name_map: dict
             priority += 3
         if vol.get("volume_spike"):
             priority += 2
-        if roe_info.get("passes_roe"):
-            priority += 1
         if momentum["momentum_score"] >= 4:
             priority += 1
 
-        market_cap = info.get("marketCap", 0)
-        cap_oku = round(market_cap / 1e8, 1) if market_cap else None
-
-        return {
+        results.append({
             "コード": code,
-            "銘柄名": name_map.get(code, info.get("shortName", info.get("longName", code))),
+            "銘柄名": name_map.get(code, code),
             "現在値": high_info.get("current_price", 0),
             "直近高値": high_info.get("period_high", 0),
             "高値日付": high_info.get("period_high_date", ""),
@@ -261,66 +333,108 @@ def _analyze_one(code: str, source: DataSourceBase, market: dict, name_map: dict
             "最大DD(%)": false_bk.get("max_drawdown_pct", 0),
             "出来高倍率": vol.get("volume_ratio", 0),
             "出来高急増": vol.get("volume_spike", False),
-            "ROE(%)": roe_info.get("roe"),
+            "ROE(%)": None,
             "モメンタム": momentum["momentum_score"],
             "トレンド": momentum["trend"],
-            "時価総額(億)": cap_oku,
-            "セクター": info.get("sector", ""),
+            "時価総額(億)": None,
+            "セクター": "",
             "候補": is_candidate,
             "優先度": priority,
             "材料": "",
             "相場環境": "⚠️注意" if market.get("market_caution") else "通常",
             "日経変動(%)": market.get("nikkei_change_pct"),
             "損切ライン": round(high_info.get("current_price", 0) * (1 - Screening.stop_loss_pct / 100), 1),
-        }
-    except Exception:
-        return None
+        })
 
+    return pd.DataFrame(results)
+
+
+# ---------------------------------------------------------------------------
+# 候補銘柄のみ詳細情報取得
+# ---------------------------------------------------------------------------
+
+def _enrich_candidates(df: pd.DataFrame, progress_callback=None) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    target = df[df["新高値"]].copy()
+    if target.empty:
+        return df
+
+    codes = target["コード"].tolist()
+
+    if progress_callback:
+        progress_callback(0.85, f"候補{len(codes)}銘柄の詳細取得中...")
+
+    def fetch_info(code):
+        try:
+            ticker = yf.Ticker(f"{code}.T")
+            info = ticker.info
+            roe_info = check_roe(info)
+            market_cap = info.get("marketCap", 0)
+            cap_oku = round(market_cap / 1e8, 1) if market_cap else None
+            return code, roe_info.get("roe"), roe_info.get("passes_roe", False), cap_oku, info.get("sector", "")
+        except Exception:
+            return code, None, False, None, ""
+
+    info_map = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_info, c) for c in codes]
+        for future in as_completed(futures):
+            code, roe, passes_roe, cap, sector = future.result()
+            info_map[code] = (roe, passes_roe, cap, sector)
+
+    for idx, row in df.iterrows():
+        code = row["コード"]
+        if code in info_map:
+            roe, passes_roe, cap, sector = info_map[code]
+            df.at[idx, "ROE(%)"] = roe
+            df.at[idx, "時価総額(億)"] = cap
+            df.at[idx, "セクター"] = sector
+            if passes_roe:
+                df.at[idx, "優先度"] = row["優先度"] + 1
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 統合スクリーニング
+# ---------------------------------------------------------------------------
 
 def screen_breakout(
     codes: list[str] | None = None,
     progress_callback=None,
     max_workers: int = 10,
 ) -> pd.DataFrame:
-    """全フィルタを適用した新高値ブレイクスクリーニング（並列実行）。"""
     if codes is None:
         codes = SCREEN_CODES
 
     source = get_data_source()
     market = check_market_environment(source)
     name_map = _get_name_map()
-    results = []
-    total = len(codes)
-    done_count = 0
-    lock = threading.Lock()
 
-    def on_done(future):
-        nonlocal done_count
-        with lock:
-            done_count += 1
-            if progress_callback:
-                progress_callback(done_count / total, f"分析中... ({done_count}/{total})")
+    # Phase 1: OHLCV取得（キャッシュ活用）
+    ohlcv_map = _batch_download_and_cache(codes, progress_callback)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for code in codes:
-            f = executor.submit(_analyze_one, code, source, market, name_map)
-            f.add_done_callback(on_done)
-            futures[f] = code
+    if progress_callback:
+        progress_callback(0.75, f"{len(ohlcv_map)}銘柄のフィルタ中...")
 
-        for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                results.append(result)
+    # Phase 2: フル分析
+    df = _full_analysis(ohlcv_map, market, name_map)
 
-    df = pd.DataFrame(results)
+    # Phase 3: 候補のみ詳細取得
+    df = _enrich_candidates(df, progress_callback)
+
     if not df.empty:
         df = df.sort_values(["候補", "優先度", "モメンタム"], ascending=[False, False, False])
+
+    if progress_callback:
+        progress_callback(1.0, "完了")
+
     return df
 
 
 def get_candidates(df: pd.DataFrame) -> pd.DataFrame:
-    """候補フラグが立っている銘柄のみ抽出。"""
     if df.empty:
         return df
     return df[df["候補"]].copy()

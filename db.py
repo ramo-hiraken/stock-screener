@@ -53,6 +53,87 @@ def is_cache_fresh(code: str) -> bool:
     return datetime.now() - last < timedelta(hours=Database.cache_hours)
 
 
+def get_fresh_codes(codes: list[str]) -> tuple[list[str], list[str]]:
+    """キャッシュがフレッシュな銘柄とstaleな銘柄を分ける。"""
+    if Database.cache_hours == 0:
+        return [], codes
+
+    conn = _get_conn()
+    fresh = []
+    stale = []
+    cutoff = (datetime.now() - timedelta(hours=Database.cache_hours)).isoformat()
+
+    placeholders = ",".join("?" for _ in codes)
+    rows = conn.execute(
+        f"SELECT code, last_fetched FROM fetch_log WHERE code IN ({placeholders})",
+        codes,
+    ).fetchall()
+    conn.close()
+
+    fresh_set = {r[0] for r in rows if r[1] >= cutoff}
+
+    for code in codes:
+        if code in fresh_set:
+            fresh.append(code)
+        else:
+            stale.append(code)
+
+    return fresh, stale
+
+
+def save_ohlcv_batch(data: dict[str, pd.DataFrame]):
+    """複数銘柄のOHLCVを一括保存。"""
+    if not data:
+        return
+    conn = _get_conn()
+    now_iso = datetime.now().isoformat()
+
+    for code, df in data.items():
+        if df.empty:
+            continue
+        rows = []
+        for idx, row in df.iterrows():
+            date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+            rows.append((
+                code, date_str,
+                float(row["Open"]), float(row["High"]),
+                float(row["Low"]), float(row["Close"]),
+                int(row["Volume"]),
+            ))
+        conn.executemany(
+            "INSERT OR REPLACE INTO ohlcv (code, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO fetch_log (code, last_fetched) VALUES (?, ?)",
+            (code, now_iso),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def load_ohlcv_batch(codes: list[str], days: int = 500) -> dict[str, pd.DataFrame]:
+    """複数銘柄のOHLCVをキャッシュから一括読み込み。"""
+    conn = _get_conn()
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    result = {}
+
+    for code in codes:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close, volume FROM ohlcv WHERE code = ? AND date >= ? ORDER BY date",
+            (code, cutoff),
+        ).fetchall()
+        if rows:
+            df = pd.DataFrame(rows, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.set_index("Date")
+            result[code] = df
+
+    conn.close()
+    return result
+
+
 def save_ohlcv(code: str, df: pd.DataFrame):
     if df.empty:
         return
