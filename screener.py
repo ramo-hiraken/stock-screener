@@ -216,6 +216,10 @@ def _analyze_one(code: str, source: DataSourceBase, market: dict, name_map: dict
         if hist.empty or len(hist) < 20:
             return None
 
+        last_trade = hist.index[-1]
+        if (pd.Timestamp.now() - last_trade).days > 7:
+            return None
+
         info = source.fetch_info(code)
 
         high_info = detect_new_high(hist)
@@ -276,7 +280,7 @@ def _analyze_one(code: str, source: DataSourceBase, market: dict, name_map: dict
 def screen_breakout(
     codes: list[str] | None = None,
     progress_callback=None,
-    max_workers: int = 5,
+    max_workers: int = 10,
 ) -> pd.DataFrame:
     """全フィルタを適用した新高値ブレイクスクリーニング（並列実行）。"""
     if codes is None:

@@ -5,7 +5,7 @@ data_source: yfinance  # yfinance | jquants
 
 # スクリーニング対象の市場区分
 # グロース / スタンダード / プライム / グロース+スタンダード
-target_market: グロース
+target_market: スタンダード+グロース
 
 # J-Quants API設定（data_source: jquants の場合に使用）
 jquants:

@@ -37,7 +37,7 @@ with tab1:
     with st.expander("フィルタ設定", expanded=False):
         fc1, fc2, fc3, fc4 = st.columns(4)
         with fc1:
-            market_options = ["グロース", "スタンダード", "プライム", "グロース+スタンダード"]
+            market_options = ["スタンダード+グロース", "グロース", "スタンダード", "プライム"]
             selected_market = st.selectbox("対象市場", market_options, index=0)
             custom_codes = st.text_area(
                 "銘柄コード（カンマ区切り、空欄で上記市場全銘柄）",

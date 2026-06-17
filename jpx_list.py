@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 _CACHE_DIR = Path(__file__).parent / "data"
 _CACHE_FILE = _CACHE_DIR / "jpx_listed.csv"
-_CACHE_TTL_HOURS = 24 * 7
+_CACHE_TTL_HOURS = 24
 
 JPX_DATA_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 
